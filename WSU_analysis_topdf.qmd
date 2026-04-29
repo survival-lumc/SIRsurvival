@@ -1,0 +1,402 @@
+---
+title: "WSU data analysis"
+author: "Hein Putter"
+pdf-engine: pdflatex
+format:
+  pdf:
+    geometry:
+      - top=30mm
+      - left=30mm
+    number-sections: true
+    colorlinks: true
+    keep-tex: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+library(tidyverse)
+library(readxl)
+library(deSolve)
+library(Epi)
+options(width=120)
+knitr::opts_knit$set(progress = TRUE, verbose = TRUE, width=90)
+knitr::opts_chunk$set(fig.width=6, fig.height=6, fig.path='Figs/',
+                      echo=TRUE, warning=FALSE, message=FALSE)
+```
+
+# Introduction
+
+This is data, analysed in Miller et al. (2013), Schwartz et al. (2015), and KhudaBukhsh et al. (2019), of an outbreak of H1N1 influenza (swine flue) on the campus of Washington State University in the Fall of 2009. The aim of the analysis is to show how the techniques developed in this paper can be used to obtain additional insight. Earlier accounts already argued that this data set may be considered as obtained from an approximately closed population, and under- or over-reporting of infections may be considered a relatively minor issue (Schwartz, Morgan \& Lapin, 2015). The data consist of daily counts of new infections. We start from a given number of initially infected individuals, $I(0)$, first taken to be 11, the number of symptomatic individuals at the start. We obtained data of the number of newly infected individuals from day 1 through to 101, from Figure 6 of KhudaBukhsh et al. (2019), kindly provided by dr. KhudaBukhsh. These are shown below.
+
+```{r counts}
+# Read in data
+d <- read.csv('Data1.csv')
+d <- d[-(105:110),]
+n <- length(d[,1])
+d <- d[,1]
+dd <- data.frame(idx = seq(1,length(d[-n])),d=d[-n])
+aggr <- dd # from now on using own code
+names(aggr) <- c("day", "newinf")
+
+ggplot(aggr, aes(x = day, y = newinf)) +
+  geom_point() +
+  labs(x = "Days since outbreak detection", y = "New Infections") +
+  theme_minimal()
+```
+
+Now, assuming, as in Schwartz et al. (2015), an exponential time to recovery with rate $\gamma = 0.2$, and a population size $n = 18,234$, we can build a long format survival data set along the lines of Section 5. I am putting this in a function for later use.
+
+```{r}
+construct_longformatdata <- function(data, n, gamma, I0, tau)
+{
+  #####----------
+  # Construct long format "survival" data set for analysis
+  #####----------
+  # Vector p, with p[j] containing probability of still being infectious
+  # j-1 days after infection
+  p <- 1 - pexp(0:tau, rate = gamma)
+  # Structure for analysis data, "empty" rows will be deleted later
+  ana <- matrix(0, 2 * tau, 5) # columns are start, stop, ninf, status, weight
+  # Initialize
+  vnewinf <- cuminf <- I0
+  for (i in 1:tau) {
+    # Number of infected at start of bin (day)
+    ninf <- c(crossprod(vnewinf, rev(p[1:i])))
+    # Number of newly infected
+    idxi <- match(i, aggr$day)
+    newinf <- ifelse(is.na(idxi), 0, data$newinf[idxi]) # current newly infected
+    cuminf <- cuminf + newinf # cumulative number of infected
+    vnewinf <- c(vnewinf, newinf) # add newinf to vector vnewinf
+    # Construct two rows for analysis data
+    ana[2 * (i-1) + 1, ] <- c(i-1, i, ninf, 1, newinf)
+    ana[2 * (i-1) + 2, ] <- c(i-1, i, ninf, 0, n - cuminf)
+  }
+  # Make into data frame
+  ana <- as.data.frame(ana)
+  names(ana) <- c("Tstart", "Tstop", "ninf", "status", "weight")
+  # Remove "empty" rows, days without new infections, weight will be zero
+  ana <- subset(ana, weight > 0)
+  ana <- as_tibble(ana)
+  
+  # Further preparations for analysis
+  ana <- as_tibble(ana) %>% 
+    mutate(pinf = ninf / n,
+           logpinf = log(pinf),
+           fuptime = 1,
+           logfuptime = log(fuptime))
+  ana <- ana[-(1:2), ] # remove the rows with initial infections
+  ana$Tstart <- ana$Tstart - 1 # and set time back one day
+  ana$Tstop <- ana$Tstop - 1
+  ana$mid <- (ana$Tstart + ana$Tstop) / 2
+  
+  return(ana)
+}
+```
+
+Applying this function with `I0` set to 11 gives
+
+```{r}
+# Sample size and gamma from the paper
+n <- 18234
+gamma <- 0.2
+# Total length of epidemic considered (just going a bit beyond 101)
+tau <- 120
+
+ana <- construct_longformatdata(aggr, n = n, gamma = gamma, I0 = 11, tau = tau)
+ana %>% print(n = 20)
+```
+
+The figure below shows the number of currently infected individuals (the prevalence of infecteds) over the course of the epidemic.
+
+```{r}
+plot(ana$Tstop, ana$ninf, type = "l", lwd = 2,
+     xlab = "Days since outbreak detection",
+     ylab = "Prevalence of infecteds")
+```
+
+With this data format, it is straightforward to estimate $\beta$ using Poisson regression, leading to the following estimate and 95\% confidence interval.
+
+```{r}
+poisreg <- glm(status ~ offset(logpinf) + offset(logfuptime),
+               data = ana, weights = weight, family = "poisson")
+# summary(poisreg)
+cipoisreg <- confint(poisreg)
+tmp <- c(poisreg$coef, cipoisreg)
+bbb <- as.numeric(exp(poisreg$coef))
+exp(tmp)
+```
+
+We can check this with the direct expression of Becker \& Britton (1999):
+
+```{r}
+ana1 <- ana %>%
+  group_by(Tstop) %>%
+  summarize(S = sum(weight), cnt = n(), pinf = sum(pinf) / cnt)
+denom <- sum(ana1$S * ana1$pinf)
+num <- sum(ana$weight * ana$status)
+num / denom
+```
+
+This gives exactly the same result. Calculation of the log-likelihood, also given in Becker \& Britton (1999), is also possible, and will be used later more extensively.
+
+```{r}
+loglik <- sum(log(bbb * ana$weight * ana$pinf) * ana$status) -
+  sum(ana$weight * ana$status)
+loglik
+```
+
+Note that with $\hat{\beta} = 0.194$ and $\gamma = 0.2$, the $R_0$ for the estimated transmission parameter $\hat{\beta}$ is in fact smaller than 1!
+
+# Lack of fit
+
+Schwartz et al. (2015) noticed a discrepancy of the newly infected individuals from the original data, as compared with that predicted by the model, see their Figure 2. We can indeed confirm this discrepancy, see the plot below, showing the original numbers together with the model-based numbers, clearly indicating a severe mismatch.
+
+```{r fit11}
+# Check number of new infections with that obtained by
+# theoretical numbers from ODE with MLE beta
+parameters <- c(beta = bbb, gamma = 0.2) # parameter values
+state <- c(S = 1 - 11/18234, I = 11/18234, R = 0) # starting values for the system
+# Definition of the system of ODE's
+SIR_ODE <- function(time, state, parameters) {
+  with(as.list(c(state, parameters)), {
+    # rate of change
+    dS <- -beta * S * I
+    dI <- beta * S * I - gamma * I
+    dR <- gamma * I
+    # return the rate of change
+    list(c(dS, dI, dR))
+  }) # end with(as.list ...
+}
+# Now run the system for some time, using the ode() function of {deSolve}
+times <- seq(0, 120, by = 0.1)
+out <- ode(y = state, times = times, func = SIR_ODE, parms = parameters)
+out <- as.data.frame(out)
+# Check with observed number of new infections
+# That would be the decrease in susceptibles over each day * n
+outdays <- out[1 + 10 * (0:120), ]
+outdays$newinf <- -diff(c(1, outdays$S)) * n
+outdays <- outdays[-1, ]
+
+# Combine the data frames, ensuring they have a common column name for the x-axis
+# (assuming 'day' and 'time' are compatible and represent the same variable)
+aggr$type <- "points"
+outdays$type <- "lines"
+combined_data <- rbind(
+  data.frame(x = aggr$day, y = aggr$newinf, type = aggr$type),
+  data.frame(x = outdays$time, y = outdays$newinf, type = outdays$type)
+)
+
+# Plot using ggplot2
+ggplot(combined_data, aes(x = x, y = y, group = type)) +
+  geom_point(data = subset(combined_data, type == "points"), aes(x = x, y = y)) +
+  geom_line(data = subset(combined_data, type == "lines"), aes(x = x, y = y)) +
+  labs(x = "Days since outbreak detection", y = "New Infections") +
+  theme_minimal()
+```
+
+Schwartz et al. (2015) went on to refit the model assuming a different number of initially infected individuals $I(0)$, using least squares estimation (LSE). We will follow the idea of re-estimating $\beta$ with different number of initial infectives, but relying on a profile likelihood framework, profiling out $I(0)$. Concretely, for each value of $I(0)$ in a reasonable frame -- we take $I(0) = 1, \ldots, 300$, we re-estimate $\beta$ and calculate the maximized log-likelihood. The next plot first shows $\hat{\beta}$ as a function of $I(0)$.
+
+```{r profloglik}
+nI0 <- 300
+profloglik <- betaseq <- rep(NA, nI0) # save space for loglik values
+for (j in 1:nI0) {
+  ana <- construct_longformatdata(aggr, n = n, gamma = gamma, I0 = j, tau = tau)
+  ana1 <- ana %>%
+    group_by(Tstop) %>%
+    summarize(S = sum(weight), cnt = n(), pinf = sum(pinf) / cnt)
+  poisreg <- glm(status ~ offset(logpinf) + offset(logfuptime),
+                 data = ana, weights = weight, family = "poisson")
+  betaseq[j] <- exp(poisreg$coef)
+  denom <- sum(ana1$S * ana1$pinf)
+  profloglik[j] <- sum(log(betaseq[j] * ana$weight * ana$pinf) * ana$status) -
+    sum(ana$weight * ana$status)
+}
+plot(betaseq, type = "l", lwd = 2,
+     xlab = "Initial number of infectives",
+     ylab = "Estimated transmission parameter")
+```
+
+The estimated transmission parameters decreased from `r round(betaseq[1], 3)` for $I(0) = 1$ to `r round(betaseq[nI0], 3)` for $I(0) =$ `r nI0`.
+
+The figure below shows a plot of the maximized log-likelihood, as a function of $I(0)$, the initial number of infectives.
+
+```{r profloglikplot}
+plot(profloglik, type = "l", lwd = 2,
+     xlab = "Initial number of infectives",
+     ylab = "Estimated transmission parameter")
+```
+
+As can be seen, we indeed see the log-likelihood curve maximizing at $I(0) = 124$, reasonably in line with the findings of Schwartz et al. (2015) based on LSE, pointing to an optimal $I(0)$ of 105. In fact, this choice would lead to an ODE-model-based number of new infections as shown below.
+
+```{r fit124}
+I0 <- 124
+ana <- construct_longformatdata(aggr, n = n, gamma = gamma, I0 = I0, tau = tau)
+poisreg <- glm(status ~ offset(logpinf) + offset(logfuptime),
+               data = ana, weights = weight, family = "poisson")
+bbb <- as.numeric(exp(poisreg$coef)) # the betahat for this given I(0)
+# Check number of new infections with that obtained by
+# theoretical numbers from ODE with MLE beta
+parameters <- c(beta = bbb, gamma = 0.2) # parameter values
+state <- c(S = 1 - I0/18234, I = I0/18234, R = 0) # starting values for the system
+# Definition of the system of ODE's
+SIR_ODE <- function(time, state, parameters) {
+  with(as.list(c(state, parameters)), {
+    # rate of change
+    dS <- -beta * S * I
+    dI <- beta * S * I - gamma * I
+    dR <- gamma * I
+    # return the rate of change
+    list(c(dS, dI, dR))
+  }) # end with(as.list ...
+}
+# Now run the system for some time, using the ode() function of {deSolve}
+times <- seq(0, 120, by = 0.1)
+out <- ode(y = state, times = times, func = SIR_ODE, parms = parameters)
+out <- as.data.frame(out)
+# Check with observed number of new infections
+# That would be the decrease in susceptibles over each day * n
+outdays <- out[1 + 10 * (0:120), ]
+outdays$newinf <- -diff(c(1, outdays$S)) * n
+outdays <- outdays[-1, ]
+
+# Combine the data frames, ensuring they have a common column name for the x-axis
+# (assuming 'day' and 'time' are compatible and represent the same variable)
+aggr$type <- "points"
+outdays$type <- "lines"
+combined_data <- rbind(
+  data.frame(x = aggr$day, y = aggr$newinf, type = aggr$type),
+  data.frame(x = outdays$time, y = outdays$newinf, type = outdays$type)
+)
+
+# Plot using ggplot2
+ggplot(combined_data, aes(x = x, y = y, group = type)) +
+  geom_point(data = subset(combined_data, type == "points"), aes(x = x, y = y)) +
+  geom_line(data = subset(combined_data, type == "lines"), aes(x = x, y = y)) +
+  labs(x = "Days since outbreak detection", y = "New Infections") +
+  theme_minimal()
+```
+
+A similar plot for $I(0) = 300$, leads to a fit that is still far from optimal. Basically, since $R_0 < 1$, any fitted number of new infections will decrease when $\hat{\beta}$ is constant.
+
+```{r fit300}
+I0 <- 300
+ana <- construct_longformatdata(aggr, n = n, gamma = gamma, I0 = I0, tau = tau)
+poisreg <- glm(status ~ offset(logpinf) + offset(logfuptime),
+               data = ana, weights = weight, family = "poisson")
+bbb <- as.numeric(exp(poisreg$coef)) # the betahat for this given I(0)
+# Check number of new infections with that obtained by
+# theoretical numbers from ODE with MLE beta
+parameters <- c(beta = bbb, gamma = 0.2) # parameter values
+state <- c(S = 1 - I0/18234, I = I0/18234, R = 0) # starting values for the system
+# Definition of the system of ODE's
+SIR_ODE <- function(time, state, parameters) {
+  with(as.list(c(state, parameters)), {
+    # rate of change
+    dS <- -beta * S * I
+    dI <- beta * S * I - gamma * I
+    dR <- gamma * I
+    # return the rate of change
+    list(c(dS, dI, dR))
+  }) # end with(as.list ...
+}
+# Now run the system for some time, using the ode() function of {deSolve}
+times <- seq(0, 120, by = 0.1)
+out <- ode(y = state, times = times, func = SIR_ODE, parms = parameters)
+out <- as.data.frame(out)
+# Check with observed number of new infections
+# That would be the decrease in susceptibles over each day * n
+outdays <- out[1 + 10 * (0:120), ]
+outdays$newinf <- -diff(c(1, outdays$S)) * n
+outdays <- outdays[-1, ]
+
+# Combine the data frames, ensuring they have a common column name for the x-axis
+# (assuming 'day' and 'time' are compatible and represent the same variable)
+aggr$type <- "points"
+outdays$type <- "lines"
+combined_data <- rbind(
+  data.frame(x = aggr$day, y = aggr$newinf, type = aggr$type),
+  data.frame(x = outdays$time, y = outdays$newinf, type = outdays$type)
+)
+
+# Plot using ggplot2
+ggplot(combined_data, aes(x = x, y = y, group = type)) +
+  geom_point(data = subset(combined_data, type == "points"), aes(x = x, y = y)) +
+  geom_line(data = subset(combined_data, type == "lines"), aes(x = x, y = y)) +
+  labs(x = "Days since outbreak detection", y = "New Infections") +
+  theme_minimal()
+```
+
+The considerable lack of fit to the number of newly infected individuals clearly points to violations of the original assumptions. Without aiming for a comprehensive assessment of all assumptions (the value of $\gamma$, sample size, closed population, no mis-reporting), one assumption that is open for scrutiny is the assumption of constant transmission parameter $\beta$. In fact, based on the long format data that has already been constructed, it is rather straightforward to obtain a spline-based estimate of a time-varying transmission parameter $\beta(t)$, using Poisson regression. This leads to the following plot, suggesting a highly variable transmission parameter.
+
+```{r poisfit}
+ana <- construct_longformatdata(aggr, n = n, gamma = gamma, I0 = 11, tau = tau)
+# What seems to be the matter is a non-constant beta, which we can estimate
+tinf <- 1:120
+t.kn <- (0:5) * 20 + 1
+poisfit2 <- glm(status ~ Ns(mid, knots=t.kn) + offset(logfuptime) + offset(logpinf),
+                family="poisson", data=ana,
+                weights = weight)
+# summary(poisfit2)
+
+tt <- seq(0, 120, by=0.1)
+nd <- data.frame(mid=tt, logfuptime=0, logpinf=0)
+lambda <- ci.pred(poisfit2, nd) # the rates from the spline model
+matshade(tt, lambda, plot=TRUE, col="blue", lwd=2,
+         xlab="Time", ylab="Transmission rate",
+         xlim=c(0, 120), ylim=c(0, 1.2))
+```
+
+The number of newly infected individuals based on this time-varying transmission parameter can also be derived by solving the corresponding set of ODE's with the estimated $\beta(t)$. This gives a much better fit!
+
+```{r fittimevar}
+parameters <- c(gamma = 0.2) # Only gamma remains as a constant
+state <- c(S = 1 - 11/18234, I = 11/18234, R = 0) # starting values for the system
+
+# Define your beta function as before
+beta <- function(time) {
+  X <- Ns(time, knots = t.kn)
+  X <- cbind(1, X)
+  return(as.numeric(exp(X %*% poisfit2$coef)))
+}
+
+# Definition of the system of ODE's
+SIR_ODE <- function(time, state, parameters) {
+  with(as.list(c(state, parameters)), {
+    beta_value <- beta(time) # Call beta with the current time
+    # rate of change
+    dS <- -beta_value * S * I
+    dI <- beta_value * S * I - gamma * I
+    dR <- gamma * I
+    # return the rate of change
+    list(c(dS, dI, dR))
+  }) # end with(as.list ...
+}
+
+# Now run the system for some time, using the ode() function of {deSolve}
+times <- seq(0, 120, by = 0.1)
+out <- ode(y = state, times = times, func = SIR_ODE, parms = parameters)
+out <- as.data.frame(out)
+# Check with observed number of new infections
+# That would be the decrease in susceptibles over each day * n
+outdays <- out[1 + 10 * (0:120), ]
+outdays$newinf <- -diff(c(1, outdays$S)) * n
+outdays <- outdays[-1, ]
+
+# Combine the data frames, ensuring they have a common column name for the x-axis
+# (assuming 'day' and 'time' are compatible and represent the same variable)
+aggr$type <- "points"
+outdays$type <- "lines"
+combined_data <- rbind(
+  data.frame(x = aggr$day, y = aggr$newinf, type = aggr$type),
+  data.frame(x = outdays$time, y = outdays$newinf, type = outdays$type)
+)
+
+# Plot using ggplot2
+ggplot(combined_data, aes(x = x, y = y, group = type)) +
+  geom_point(data = subset(combined_data, type == "points"), aes(x = x, y = y)) +
+  geom_line(data = subset(combined_data, type == "lines"), aes(x = x, y = y)) +
+  labs(x = "Days since outbreak detection", y = "New Infections") +
+  theme_minimal()
+```
+
