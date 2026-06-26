@@ -64,7 +64,7 @@ construct_longformatdata <- function(data, n, gamma, I0, tau)
     # Number of infected at start of bin (day)
     ninf <- c(crossprod(vnewinf, rev(p[1:i])))
     # Number of newly infected
-    idxi <- match(i, aggr$day)
+    idxi <- match(i+1, aggr$day)
     newinf <- ifelse(is.na(idxi), 0, data$newinf[idxi]) # current newly infected
     cuminf <- cuminf + newinf # cumulative number of infected
     vnewinf <- c(vnewinf, newinf) # add newinf to vector vnewinf
@@ -85,9 +85,6 @@ construct_longformatdata <- function(data, n, gamma, I0, tau)
            logpinf = log(pinf),
            fuptime = 1,
            logfuptime = log(fuptime))
-  ana <- ana[-(1:2), ] # remove the rows with initial infections
-  ana$Tstart <- ana$Tstart - 1 # and set time back one day
-  ana$Tstop <- ana$Tstop - 1
   ana$mid <- (ana$Tstart + ana$Tstop) / 2
   
   return(ana)
@@ -141,12 +138,12 @@ num / denom
 This gives exactly the same result. Calculation of the log-likelihood, also given in Becker \& Britton (1999), is also possible, and will be used later more extensively.
 
 ```{r}
-loglik <- sum(log(bbb * ana$weight * ana$pinf) * ana$status) -
+loglik <- sum(ana$weight * log(bbb * ana$pinf) * ana$status) -
   sum(ana$weight * ana$status)
 loglik
 ```
 
-Note that with $\hat{\beta} = 0.194$ and $\gamma = 0.2$, the $R_0$ for the estimated transmission parameter $\hat{\beta}$ is in fact smaller than 1!
+Note that with $\hat{\beta} =$ `r round(num/denom, 3)` and $\gamma = 0.2$, the $R_0$ for the estimated transmission parameter $\hat{\beta}$ is in fact smaller than 1!
 
 # Lack of fit
 
@@ -209,7 +206,7 @@ for (j in 1:nI0) {
                  data = ana, weights = weight, family = "poisson")
   betaseq[j] <- exp(poisreg$coef)
   denom <- sum(ana1$S * ana1$pinf)
-  profloglik[j] <- sum(log(betaseq[j] * ana$weight * ana$pinf) * ana$status) -
+  profloglik[j] <- sum(ana$weight * log(betaseq[j] * ana$pinf) * ana$status) -
     sum(ana$weight * ana$status)
 }
 plot(betaseq, type = "l", lwd = 2,
@@ -224,7 +221,7 @@ The figure below shows a plot of the maximized log-likelihood, as a function of 
 ```{r profloglikplot}
 plot(profloglik, type = "l", lwd = 2,
      xlab = "Initial number of infectives",
-     ylab = "Estimated transmission parameter")
+     ylab = "Profile log-likelihood")
 ```
 
 As can be seen, we indeed see the log-likelihood curve maximizing at $I(0) = 124$, reasonably in line with the findings of Schwartz et al. (2015) based on LSE, pointing to an optimal $I(0)$ of 105. In fact, this choice would lead to an ODE-model-based number of new infections as shown below.
